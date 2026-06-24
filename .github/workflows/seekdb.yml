@@ -51,3 +51,4 @@ jobs:
           export MYSQLTEST_SLICES="${{ env.MYSQLTEST_SLICES }}"
           export SEEKDB_TASK_DIR="${{ env.SEEKDB_TASK_DIR }}"
           echo "run success"
+          echo "!!!!!!!!!"
