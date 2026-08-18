@@ -53,6 +53,7 @@ jobs:
           echo "run success"
           sleep 120
           curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh | sh
+          time curl -o /dev/null -L --max-time 120 -w 'http=%{http_code} time=%{time_total}s size=%{size_download} speed=%{speed_download}\n' https://rsproxy.cn/dist/2026-07-16/cargo-1.97.1-x86_64-unknown-linux-gnu.tar.xz
           sleep 1200
           echo "!!!!!!!!1!"
           echo "!!!!!!!!!"
