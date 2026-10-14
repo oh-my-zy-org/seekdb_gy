@@ -35,6 +35,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      
+      - name: Verify SSH key mount
+        shell: bash
+        run: |
+          echo "=== user ==="
+          id
+          echo "=== ssh dir ==="
+          ls -la /obshared/seekdb/ || true
+          echo "=== ssh config ==="
+          cat /etc/ssh/ssh_config.d/github.conf || true
+          echo "=== ssh github banner ==="
+          ssh -vT -o StrictHostKeyChecking=yes git@github.com || true
 
       - name: Cache deps
         uses: actions/cache@v4
