@@ -33,6 +33,10 @@ jobs:
     container:
       image: harbor.oceanbase-dev.com/obrde-test/ob-actions-runner-worker:0.0.2
     steps:
+      - name: Configure git to use SSH
+        shell: bash
+        run: |
+          git config --global url."git@github.com:".insteadOf "https://github.com/"
       - name: Checkout
         uses: actions/checkout@v4
       
@@ -43,11 +47,9 @@ jobs:
           id
           echo "=== ssh dir ==="
           ls -la /obshared/seekdb/ || true
-          echo "=== ssh config ==="
-          cat /etc/ssh/ssh_config.d/github.conf || true
           echo "=== ssh github banner ==="
-          ssh -vT -o StrictHostKeyChecking=yes git@github.com || true
-
+          ssh -T git@github.com || true
+   
       - name: Cache deps
         uses: actions/cache@v4
         with:
