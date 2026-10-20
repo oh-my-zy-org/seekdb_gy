@@ -1,6 +1,6 @@
-# SeekDB CI - 执行下沉版（Native）
-# setup 准备 observer → 4 个并行 mysqltest job（各独立容器）→ collect 合并结果
-name: SeekDB CI 
+# SeekDB CI：4c8g / 25c100g Runner 调度、工作卷和网络验证。
+# 每个规格同时运行两个 job；四个 job 就绪后检查节点唯一性。
+name: SeekDB CI
 
 on:
   push:
@@ -21,40 +21,157 @@ on:
   workflow_dispatch:
 
 env:
-  MYSQLTEST_SLICES: "4"
   cache-name: cache-deps
-  SEEKDB_TASK_DIR: ${{ github.workspace }}/seekdb_build/${{ github.run_id }}
   SEEKDB_RESULT_NFS_ROOT: /data/storage/jenkins_on_k8s/results/seekdb
 
 jobs:
   seekdb-setup:
-    name: setup
-    runs-on: arc-runner-k8s-ci-org-test
+    name: validate-${{ matrix.pool }}-${{ matrix.replica }}
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        pool: [4c8g, 25c100g]
+        replica: [1, 2]
+        include:
+          - pool: 4c8g
+            runner: arc-runner-k8s-ci-org-test-4c8g
+            cpu_request_m: "3000"
+            cpu_limit_m: "3000"
+            memory_request_mi: "5120"
+            memory_limit_mi: "6144"
+          - pool: 25c100g
+            runner: arc-runner-k8s-ci-org-test-25c100g
+            cpu_request_m: "22000"
+            cpu_limit_m: "23000"
+            memory_request_mi: "88064"
+            memory_limit_mi: "92160"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     container:
       image: harbor.oceanbase-dev.com/obrde-test/ob-actions-runner-worker:0.0.2
+    env:
+      EXPECTED_POOL: ${{ matrix.pool }}
+      REPLICA: ${{ matrix.replica }}
+      EXPECTED_CPU_REQUEST_M: ${{ matrix.cpu_request_m }}
+      EXPECTED_CPU_LIMIT_M: ${{ matrix.cpu_limit_m }}
+      EXPECTED_MEMORY_REQUEST_MI: ${{ matrix.memory_request_mi }}
+      EXPECTED_MEMORY_LIMIT_MI: ${{ matrix.memory_limit_mi }}
+      ARC_VALIDATION_TIMEOUT_SECONDS: "900"
+      ARC_VALIDATION_HOLD_SECONDS: "300"
     steps:
+      - name: Verify resources, volumes and concurrent node isolation
+        shell: bash
+        env:
+          ARC_RUNNER_NAME: ${{ runner.name }}
+        run: |
+          set -euo pipefail
+          python3 -u - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import time
+
+          def required(name):
+              value = os.environ.get(name, "")
+              if not value:
+                  raise SystemExit(f"Missing {name}; apply the new test-org hook ConfigMap first")
+              return value
+
+          pool, replica = required("EXPECTED_POOL"), required("REPLICA")
+          record = {
+              "pool": pool, "replica": replica,
+              "pod": required("ARC_POD_NAME"),
+              "namespace": required("ARC_POD_NAMESPACE"),
+              "node": required("ARC_NODE_NAME"),
+              "runner": required("ARC_RUNNER_NAME"),
+          }
+          for resource in ("CPU_REQUEST_M", "CPU_LIMIT_M", "MEMORY_REQUEST_MI", "MEMORY_LIMIT_MI"):
+              actual, expected = required(f"ARC_{resource}"), required(f"EXPECTED_{resource}")
+              if actual != expected:
+                  raise SystemExit(f"{pool}: {resource}={actual}, expected {expected}")
+              record[resource.lower()] = actual
+
+          # 先验证挂载的 work PVC 可写，再通过已有 NFS 交换四个 job 的调度证据。
+          probe = Path(required("GITHUB_WORKSPACE")) / f".arc-volume-probe-{pool}-{replica}"
+          probe.write_text(required("GITHUB_RUN_ID"))
+          if probe.read_text() != required("GITHUB_RUN_ID"):
+              raise SystemExit("Work PVC read/write verification failed")
+          probe.unlink()
+          evidence = (
+              Path(required("SEEKDB_RESULT_NFS_ROOT")) / "arc-pool-validation"
+              / required("GITHUB_REPOSITORY")
+              / f'{required("GITHUB_RUN_ID")}-{required("GITHUB_RUN_ATTEMPT")}'
+          )
+          evidence.mkdir(parents=True, exist_ok=True)
+          own = evidence / f"{pool}-{replica}.json"
+          expected_jobs = [f"{size}-{copy}" for size in ("4c8g", "25c100g") for copy in (1, 2)]
+
+          def heartbeat():
+              record["heartbeat"] = time.time()
+              temporary = own.with_suffix(".tmp")
+              temporary.write_text(json.dumps(record))
+              temporary.replace(own)
+
+          print(json.dumps(record, indent=2))
+          print(f"Evidence directory: {evidence}")
+          deadline = time.monotonic() + int(required("ARC_VALIDATION_TIMEOUT_SECONDS"))
+          while True:
+              heartbeat()
+              records = []
+              for job in expected_jobs:
+                  path = evidence / f"{job}.json"
+                  if path.exists():
+                      item = json.loads(path.read_text())
+                      if time.time() - item["heartbeat"] < 30:
+                          records.append(item)
+              if len(records) == 4:
+                  if len({item["node"] for item in records}) != 4:
+                      raise SystemExit("Runner/Worker jobs share a node: " + json.dumps(records))
+                  break
+              if time.monotonic() >= deadline:
+                  raise SystemExit(f"Only {len(records)}/4 active jobs; inspect Pending Pods, node pools and PVCs")
+              print(f"Waiting for all four jobs: {len(records)}/4 active")
+              time.sleep(5)
+
+          records.sort(key=lambda item: (item["pool"], item["replica"]))
+          with open(required("GITHUB_STEP_SUMMARY"), "a") as summary:
+              summary.write("### ARC concurrent scheduling validation\n\n")
+              summary.write("| Pool | Replica | Worker Pod | Node |\n|---|---|---|---|\n")
+              for item in records:
+                  summary.write(f'| {item["pool"]} | {item["replica"]} | {item["pod"]} | {item["node"]} |\n')
+              summary.write("\nPASS: four concurrent jobs use four distinct nodes; Worker resources and work PVC verified.\n")
+          print("PASS: four concurrent jobs use four distinct nodes")
+          # 保持心跳和容器存活，给其余 job 和集群侧 kubectl 检查留出时间。
+          hold_until = time.monotonic() + int(required("ARC_VALIDATION_HOLD_SECONDS"))
+          while time.monotonic() < hold_until:
+              heartbeat()
+              time.sleep(5)
+          PY
+
       - name: Configure git to use SSH
         shell: bash
         run: |
           git config --global url."git@github.com:".insteadOf "https://github.com/"
+
       - name: Checkout
         uses: actions/checkout@v4
-      
+
       - name: Verify SSH key mount
         shell: bash
         run: |
           echo "=== user ==="
           id
           echo "=== ssh dir ==="
-          ls -la /obshared/seekdb/ || true
-          echo "=== ssh github banner ==="
-          ssh -T git@github.com || true
+          ls -la /obshared/seekdb/
+          echo "=== ssh github banner (GitHub normally returns exit code 1) ==="
+          ssh -o BatchMode=yes -o ConnectTimeout=10 -T git@github.com || true
 
       - name: Verify Bazel and gh-proxy
         shell: bash
         run: |
           echo "=== 0. 检查 Pod /etc/hosts (hostAliases) ==="
-          grep -E 'releases\.bazel\.build|gh-proxy\.com' /etc/hosts || true
+          grep -E 'releases\.bazel\.build|gh-proxy\.com' /etc/hosts
 
           echo "=== 1. 验证 Bazel 下载 (releases.bazel.build) ==="
           curl --noproxy '*' -fsSL \
@@ -82,18 +199,16 @@ jobs:
           key: ${{ runner.os }}-build-${{ env.cache-name }}-el9.x86_64-${{ hashFiles('deps/init/oceanbase.el9.x86_64.deps') }}
           path: deps/3rd
 
-      - name: Prepare (jobargs, run_jobs)
+      - name: Verify Rust proxy
         shell: bash
         run: |
-          chmod +x .github/script/seekdb/prepare.sh
-          export GITHUB_RUN_ID="${{ github.run_id }}"
-          export GITHUB_WORKSPACE="${{ github.workspace }}"
-          export MYSQLTEST_SLICES="${{ env.MYSQLTEST_SLICES }}"
-          export SEEKDB_TASK_DIR="${{ env.SEEKDB_TASK_DIR }}"
-          echo "run success"
-          sleep 120
-          curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh | sh
-          time curl -o /dev/null -L --max-time 120 -w 'http=%{http_code} time=%{time_total}s size=%{size_download} speed=%{speed_download}\n' https://rsproxy.cn/dist/2026-07-16/cargo-1.97.1-x86_64-unknown-linux-gnu.tar.xz
-          sleep 1200
-          echo "!!!!!!!!1!"
-          echo "!!!!!!!!!"
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 5 --max-time 60 \
+            https://rsproxy.cn/rustup-init.sh -o "${RUNNER_TEMP}/rustup-init.sh"
+          RUSTUP_DIST_SERVER=https://rsproxy.cn \
+          RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup \
+            sh "${RUNNER_TEMP}/rustup-init.sh" -y --profile minimal --default-toolchain none
+          time curl --fail --show-error --location --output /dev/null \
+            --connect-timeout 5 --max-time 120 \
+            -w 'http=%{http_code} time=%{time_total}s size=%{size_download} speed=%{speed_download}\n' \
+            https://rsproxy.cn/dist/2026-07-16/cargo-1.97.1-x86_64-unknown-linux-gnu.tar.xz
