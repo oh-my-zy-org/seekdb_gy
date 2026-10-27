@@ -257,7 +257,7 @@ jobs:
             echo "Saved under \`${{ env.SEEKDB_RESULT_NFS_ROOT }}/${{ github.run_id }}/attempt-${{ github.run_attempt }}/slices/slice_${{ matrix.slice }}/failures/\`." >> "$GITHUB_STEP_SUMMARY"
           fi
   seekdb-collect:
-    # 仅在 4 个 mysqltest slice 都跑完（成功或失败）时执行；若 mysqltest 被 skip 则不跑
+    # 仅在 4 个 mysqltest slice 都跑完（成功或失败）时执行；若 mysqltest 被 skip  则不跑
     if: ${{ always() && needs.seekdb-mysqltest.result != 'skipped' }}
     name: collect
     needs: seekdb-mysqltest
